@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -7,6 +8,12 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from app.config import Config
 from app.db import init_db
 from app.services.errors import ServiceError
+from app.services.resume import (
+    get_resume_state,
+    list_checkpoints,
+    pause_window,
+    resume_window,
+)
 from app.services.windows import (
     coverage_report,
     list_coverage,
@@ -25,6 +32,20 @@ def _json(resp, data, status=200):
     resp.status = str(status)
     resp.content_type = "application/json"
     resp.text = json.dumps(data, ensure_ascii=False)
+
+
+def _error_body(exc: ServiceError) -> dict:
+    body = {"ok": False, "error": exc.message}
+    if exc.reason_code:
+        body["reason_code"] = exc.reason_code
+    if exc.details:
+        body.update(exc.details)
+    return body
+
+
+async def _run(fn, *args, **kwargs):
+    """把同步 SQLite 工作放线程池：并发请求才会真的抢写锁。"""
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def _read_session(req) -> dict:
@@ -111,7 +132,7 @@ class ApiWindows:
     async def on_get(self, req, resp):
         try:
             require_user(req)
-            _json(resp, {"items": list_windows()})
+            _json(resp, {"items": await _run(list_windows)})
         except ServiceError as exc:
             _json(resp, {"error": exc.message}, exc.status_code)
 
@@ -120,34 +141,80 @@ class ApiPlan:
     async def on_post(self, req, resp, window_id):
         try:
             require_user(req)
-            _json(resp, plan_slices(int(window_id)))
+            _json(resp, await _run(plan_slices, int(window_id)))
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _json(resp, _error_body(exc), exc.status_code)
 
 
 class ApiSlices:
     async def on_get(self, req, resp, window_id):
         try:
             require_user(req)
-            _json(resp, {"items": list_slices(int(window_id))})
+            _json(resp, {"items": await _run(list_slices, int(window_id))})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _json(resp, _error_body(exc), exc.status_code)
 
 
 class ApiReplay:
     async def on_post(self, req, resp, slice_id):
         try:
             require_user(req)
-            _json(resp, {"slice": replay_slice(int(slice_id))})
+            _json(resp, {"slice": await _run(replay_slice, int(slice_id))})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _json(resp, _error_body(exc), exc.status_code)
+
+
+class ApiResume:
+    async def on_get(self, req, resp, window_id):
+        try:
+            require_user(req)
+            _json(resp, await _run(get_resume_state, int(window_id)))
+        except ServiceError as exc:
+            _json(resp, _error_body(exc), exc.status_code)
+
+
+class ApiPause:
+    async def on_post(self, req, resp, window_id):
+        try:
+            user = require_user(req)
+            _json(resp, {"state": await _run(pause_window, int(window_id), actor=user)})
+        except ServiceError as exc:
+            _json(resp, _error_body(exc), exc.status_code)
+
+
+class ApiResumeAction:
+    async def on_post(self, req, resp, window_id):
+        try:
+            user = require_user(req)
+            body = await req.get_media() or {}
+            state = await _run(
+                resume_window,
+                int(window_id),
+                version=_opt_int(body.get("version")),
+                offset_no=_opt_int(body.get("offset_no")),
+                next_slice_id=_opt_int(body.get("next_slice_id")),
+                source=str(body.get("source") or "续灌"),
+                actor=str(body.get("actor") or user),
+            )
+            _json(resp, {"state": state})
+        except ServiceError as exc:
+            _json(resp, _error_body(exc), exc.status_code)
+
+
+class ApiCheckpoints:
+    async def on_get(self, req, resp, window_id):
+        try:
+            require_user(req)
+            _json(resp, {"items": await _run(list_checkpoints, int(window_id))})
+        except ServiceError as exc:
+            _json(resp, _error_body(exc), exc.status_code)
 
 
 class ApiCoverage:
     async def on_get(self, req, resp):
         try:
             require_user(req)
-            _json(resp, {"items": list_coverage()})
+            _json(resp, {"items": await _run(list_coverage)})
         except ServiceError as exc:
             _json(resp, {"error": exc.message}, exc.status_code)
 
@@ -156,11 +223,20 @@ class ApiCoverage:
             require_user(req)
             body = await req.get_media() or {}
             wid = int(body.get("window_id"))
-            _json(resp, {"report": coverage_report(wid)})
+            _json(resp, {"report": await _run(coverage_report, wid)})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _json(resp, _error_body(exc), exc.status_code)
         except (TypeError, ValueError):
             _json(resp, {"error": "window_id 无效"}, 400)
+
+
+def _opt_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ServiceError("位点参数必须是整数", 400, reason_code="BAD_CHECKPOINT")
 
 
 def create_app() -> falcon.asgi.App:
@@ -175,6 +251,10 @@ def create_app() -> falcon.asgi.App:
     app.add_route("/api/windows", ApiWindows())
     app.add_route("/api/windows/{window_id:int}/plan", ApiPlan())
     app.add_route("/api/windows/{window_id:int}/slices", ApiSlices())
+    app.add_route("/api/windows/{window_id:int}/resume-state", ApiResume())
+    app.add_route("/api/windows/{window_id:int}/pause", ApiPause())
+    app.add_route("/api/windows/{window_id:int}/resume", ApiResumeAction())
+    app.add_route("/api/windows/{window_id:int}/checkpoints", ApiCheckpoints())
     app.add_route("/api/slices/{slice_id:int}/replay", ApiReplay())
     app.add_route("/api/coverage-reports", ApiCoverage())
     app.add_static_route("/static", str(STATIC))
